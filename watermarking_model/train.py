@@ -1,5 +1,6 @@
 import os
 import torch
+import torchaudio
 import yaml
 import logging
 import argparse
@@ -9,6 +10,7 @@ from torch.optim import Adam
 from rich.progress import track
 from torch.utils.data import DataLoader
 from model.loss import Loss_identity
+from distortions.recapture import RecaptureAugmentation
 from utils.tools import save, log, save_op
 from utils.optimizer import ScheduledOptimMain, ScheduledOptimDisc, my_step
 from itertools import chain
@@ -33,6 +35,20 @@ logging_mark = "#"*20
 # warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def dump_debug_audio(out_dir, sample_rate, tag, step, encoded, recaptured, max_items=2):
+    """Debug helper: save up to `max_items` examples of the watermarked audio before
+    (`encoded`) and after (`recaptured`) the recapture augmentation to `out_dir`, one
+    pair of wav files per item, so the effect of the recapture channel can be
+    inspected by ear. Enabled via the `debug_audio` block in train.yaml."""
+    os.makedirs(out_dir, exist_ok=True)
+    n = min(max_items, encoded.shape[0])
+    for i in range(n):
+        before = encoded[i].detach().cpu().clamp(-1, 1)
+        after = recaptured[i].detach().cpu().clamp(-1, 1)
+        torchaudio.save(os.path.join(out_dir, f"{tag}_step{step}_item{i}_before.wav"), before, sample_rate)
+        torchaudio.save(os.path.join(out_dir, f"{tag}_step{step}_item{i}_after.wav"), after, sample_rate)
 
 def main(args, configs):
     logging.info('main function')
@@ -120,6 +136,23 @@ def main(args, configs):
     # ---------------- Loss
     loss = Loss_identity(train_config=train_config)
 
+    # ---------------- Recapture (RIR / noise / shift) augmentation, applied to the
+    # watermarked signal between the encoder and decoder (see the call sites below).
+    # Self-contained: does not touch distortions/dl.py or the Decoder model files.
+    recapture_aug = RecaptureAugmentation(
+        train_config.get("recapture_augmentation", {}),
+        process_config["audio"]["sample_rate"],
+        device,
+    )
+
+    # Debug: optionally dump audio before/after the recapture augmentation (see
+    # `dump_debug_audio` above and the `debug_audio` block in train.yaml). Off by
+    # default; `debug_audio_dumped` is shared across train + valid so `num_steps`
+    # caps the total number of dumps for the whole run.
+    debug_audio_cfg = train_config.get("debug_audio", {})
+    debug_audio_dir = os.path.join(train_config["path"]["log_path"], "debug_audio")
+    debug_audio_dumped = 0
+
     # ---------------- Init logger
     for p in train_config["path"].values():
         os.makedirs(p, exist_ok=True)
@@ -154,7 +187,14 @@ def main(args, configs):
             wav_matrix = sample["matrix"].to(device)
             msg = msg.to(device)
             encoded, carrier_wateramrked = encoder(wav_matrix, msg, global_step)
-            decoded = decoder(encoded, global_step)
+            recaptured = recapture_aug.apply(encoded, training=True)
+            if debug_audio_cfg.get("enabled", False) and debug_audio_dumped < debug_audio_cfg.get("num_steps", 1):
+                dump_debug_audio(
+                    debug_audio_dir, process_config["audio"]["sample_rate"], "train",
+                    global_step, encoded, recaptured, debug_audio_cfg.get("max_items", 2),
+                )
+                debug_audio_dumped += 1
+            decoded = decoder(recaptured, global_step)
             losses = loss.en_de_loss(wav_matrix, encoded, msg, decoded)
             if global_step < pre_step:
                 sum_loss = lambda_m*losses[1]
@@ -227,7 +267,14 @@ def main(args, configs):
                 wav_matrix = sample["matrix"].to(device)
                 msg = msg.to(device)
                 encoded, carrier_wateramrked = encoder(wav_matrix, msg, global_step)
-                decoded = decoder(encoded, global_step)
+                recaptured = recapture_aug.apply(encoded, training=False)
+                if debug_audio_cfg.get("enabled", False) and debug_audio_dumped < debug_audio_cfg.get("num_steps", 1):
+                    dump_debug_audio(
+                        debug_audio_dir, process_config["audio"]["sample_rate"], "val",
+                        global_step, encoded, recaptured, debug_audio_cfg.get("max_items", 2),
+                    )
+                    debug_audio_dumped += 1
+                decoded = decoder(recaptured, global_step)
                 losses = loss.en_de_loss(wav_matrix, encoded, msg, decoded)
                 # adv
                 if train_config["adv"]:

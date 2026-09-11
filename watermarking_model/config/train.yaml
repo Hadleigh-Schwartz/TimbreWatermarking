@@ -45,3 +45,56 @@ iter:
   save_circle: 5
   show_circle: 100
   val_circle: 100
+
+
+# Reverberation / background noise / random time-shift augmentation, applied to the
+# watermarked signal right before it reaches the decoder (see the isolated call in
+# train.py, between the encoder and decoder). Mirrors the channel simulation in
+# acoustic_embedding/echo/neural_decoding/data/sim_dataloader.py, and the
+# `recapture_augmentation` block added to audiocraft's
+# config/augmentations/default.yaml -- same RIR/noise datasets and splits, so both
+# models are trained against the same simulated channel.
+recapture_augmentation:
+  use: true # opt-in: requires rir_dirs/noise_dirs pointing at local RIR/noise data
+  reverb: true
+  background_noise: true
+  shift: true
+  # --- reverberation: train RIRs (mirrors train_rir_datasets: ["AIR", "ARNI",
+  #     "Palimpsest"] in neural_decoding/configs/model_config_13bps.yaml). ARNI is
+  #     subsampled to 1000 files at load time (see `_apply_arni_subsampling` in
+  #     distortions/recapture.py), mirroring arni_rir_data.py's "EARS precedent"
+  #     subsampling. ---
+  rir_dirs:
+    - /media/storage/hadleigh/stegaphone_data/ears_rirs/AIR/AIR_1_4/AIR_wav_files
+    - /media/storage/hadleigh/stegaphone_data/ears_rirs/ARNI
+    - /media/storage/hadleigh/stegaphone_data/ears_rirs/Palimpsest
+  # --- reverberation: held-out RIRs used only for the valid stage (mirrors
+  #     val_rir_datasets: ["BRUDEX", "dechorate"] in the neural_decoding configs).
+  #     BRUDEX ships as v7.3 .mat files (read via `_read_mat_rir`, requires the
+  #     `mat73` package). Leave null / empty to reuse the train RIRs during
+  #     validation. ---
+  valid_rir_dirs:
+    - /media/storage/hadleigh/stegaphone_data/ears_rirs/BRUDEX
+    - /media/storage/hadleigh/stegaphone_data/dEchorate_unpacked
+  rir_duration: 1.00137 # seconds each RIR is padded/truncated to (sim_dataloader.py default)
+  reverb_amplitude_range: [0.990, 0.99999] # RIR peak (direct-path) gain, applied per sample (sim_dataloader.py)
+  # --- background noise: DEMAND. Top-level location dirs listed in
+  #     valid_noise_locations are held out for the valid stage; every other location
+  #     is used for training (mirrors the train/valid split in
+  #     neural_decoding/data/demand_noise_data.py). Leave null / empty to reuse the
+  #     train noise during validation. ---
+  noise_dirs:
+    - /media/storage/hadleigh/stegaphone_data/demand
+  valid_noise_locations: [TCAR, OOFFICE]
+  demand_noise_snrs: [0, 5, 10, 15, 20, 25, 30] # dB, sampled discretely (neural_decoding default)
+  max_num_noise_files: null
+  shift_range: [20, 200] # samples
+
+
+# Debug: dump example audio before/after the recapture augmentation to
+# <path.log_path>/debug_audio/ so it can be inspected by ear. Off by default; enable
+# for one run with `debug_audio.enabled=true` (or just edit this file).
+debug_audio:
+  enabled: true
+  num_steps: 1   # dump for the first N times recapture is applied (train + valid), then stop
+  max_items: 2   # batch items saved per dump
